@@ -1,0 +1,18 @@
+# ===== Restricted raw data (do NOT commit — see data/README.md) =====
+data/public.csv
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# ===== OS / editor =====
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ===== Local outputs (regenerate via code) =====
+output/tables/*.csv
+output/figures/*.png
