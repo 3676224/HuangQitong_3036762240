@@ -1,6 +1,9 @@
 # ===== Restricted raw data (do NOT commit — see data/raw/README.md) =====
 data/raw/public.csv
 
+# ===== Processed data (derived from restricted data — do NOT commit) =====
+data/processed/*.csv
+
 # ===== Python =====
 __pycache__/
 *.py[cod]
