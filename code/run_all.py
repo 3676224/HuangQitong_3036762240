@@ -625,6 +625,118 @@ def table7_prices(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def extension_randomization(df: pd.DataFrame, n_perm: int = 10000, seed: int = 42):
+    """Independent extension: randomization inference (permutation tests).
+
+    Under the sharp null that the New Jersey minimum wage had no effect on any
+    store's employment, the change in FTE employment is exchangeable across
+    stores. We therefore permute the treatment assignment and reconstruct the
+    null distribution of two headline statistics:
+
+      1. the difference-in-differences estimate  mean(dFTE | NJ) - mean(dFTE | PA)
+      2. the reduced-form coefficient on the wage gap  (dFTE ~ GAP + controls)
+
+    The permutation p-value is the fraction of permuted statistics at least as
+    extreme as the observed one; it is compared with the paper's asymptotic
+    (normal) p-value, which assumes normality of the sampling distribution.
+    """
+    from scipy.stats import norm
+
+    rng = np.random.default_rng(seed)
+
+    # ---- (1) DiD on the balanced sample (open + permanently-closed stores) ----
+    d_nj = df.loc[df.STATE == 1, "dfte"].dropna().to_numpy()
+    d_pa = df.loc[df.STATE == 0, "dfte"].dropna().to_numpy()
+    d = np.concatenate([d_nj, d_pa])
+    state = np.concatenate([np.ones(len(d_nj)), np.zeros(len(d_pa))])
+    n1 = int(state.sum())
+    n0 = int((state == 0).sum())
+    obs_did = d[state == 1].mean() - d[state == 0].mean()
+    se_did = np.sqrt(d[state == 1].var(ddof=1) / n1 + d[state == 0].var(ddof=1) / n0)
+    t_did = obs_did / se_did
+    perm_did = np.empty(n_perm)
+    for i in range(n_perm):
+        dp = rng.permutation(d)
+        perm_did[i] = dp[state == 1].mean() - dp[state == 0].mean()
+
+    # ---- (2) wage-gap coefficient (Table 4 model iv sample, n = 357) ----
+    open_mask = (
+        (df.STATUS2 == 1)
+        & df.fte1.notna() & df.fte2.notna()
+        & df.WAGE_ST.notna() & df.WAGE_ST2.notna()
+    )
+    closed_mask = (df.STATUS2 == 3) & df.fte1.notna() & df.WAGE_ST.notna()
+    s = df.loc[open_mask | closed_mask]
+    y = s.dfte.to_numpy()
+    gap = s.gap.to_numpy()
+    chain = pd.get_dummies(s.CHAIN, prefix="c").drop(columns=["c_1"]).to_numpy()
+    coown = s.CO_OWNED.to_numpy().reshape(-1, 1)
+    ctrl = np.column_stack([chain, coown])
+    r_obs = _ols(y, np.column_stack([gap, ctrl]))
+    obs_gap = r_obs["beta"][1]
+    se_gap = r_obs["se"][1]
+    t_gap = obs_gap / se_gap
+    perm_gap = np.empty(n_perm)
+    for i in range(n_perm):
+        rr = _ols(y, np.column_stack([rng.permutation(gap), ctrl]))
+        perm_gap[i] = rr["beta"][1]
+
+    # ---- assemble comparison table ----
+    def row(name, obs, se, t, perm, n):
+        p1 = float((perm >= obs).mean())
+        p2 = float((np.abs(perm) >= np.abs(obs)).mean())
+        return {
+            "Statistic": name,
+            "observed": obs,
+            "se": se,
+            "t": t,
+            "asymptotic_p_2sided": 2 * (1 - norm.cdf(abs(t))),
+            "perm_p_1sided": p1,
+            "perm_p_2sided": p2,
+            "n_sample": n,
+            "n_perm": n_perm,
+        }
+
+    table = pd.DataFrame(
+        [
+            row("DiD (mean dFTE NJ - PA)", obs_did, se_did, t_did, perm_did, len(d)),
+            row("GAP coefficient (levels)", obs_gap, se_gap, t_gap, perm_gap, len(y)),
+        ]
+    )
+
+    # ---- figure: permutation distributions ----
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    for ax, obs, perm, title in [
+        (axes[0], obs_did, perm_did, "DiD: mean ΔFTE (NJ) − mean ΔFTE (PA)"),
+        (axes[1], obs_gap, perm_gap, "Reduced-form wage-gap coefficient"),
+    ]:
+        p2 = (np.abs(perm) >= np.abs(obs)).mean()
+        ax.hist(perm, bins=60, color="0.82", edgecolor="black",
+                linewidth=0.4, density=True)
+        ax.axvline(obs, color="red", linewidth=2, label=f"observed = {obs:.2f}")
+        ax.set_title(f"{title}\npermutation p (two-sided) = {p2:.4f}", fontsize=9)
+        ax.set_xlabel("Permuted statistic")
+        ax.set_ylabel("Density")
+        ax.legend(fontsize=8)
+
+    fig.suptitle(
+        "Randomization inference: null distributions under the sharp null "
+        "of no minimum-wage effect",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    fig_path = FIGURES_DIR / "figure_extension_randomization.png"
+    fig.savefig(fig_path, dpi=150)
+    plt.close(fig)
+
+    return table, fig_path
+
+
 def step1_build_sample() -> pd.DataFrame:
     """Reconstruct variables (FTE employment, wage GAP) and write processed data."""
     df = build_sample(load_raw())
@@ -672,16 +784,20 @@ def step2_replicate(df: pd.DataFrame) -> None:
     print(f"  figure 1 -> {fig1}")
 
 
-def step3_extension() -> None:
-    """Run the independent extension."""
-    print("  extension: not yet implemented (TODO).")
+def step3_extension(df: pd.DataFrame) -> None:
+    """Run the independent extension (randomization inference)."""
+    table, fig = extension_randomization(df)
+    TABLES_DIR.mkdir(parents=True, exist_ok=True)
+    table.to_csv(TABLES_DIR / "extension_randomization.csv", index=False)
+    print(f"  extension (randomization inference) -> "
+          f"{TABLES_DIR / 'extension_randomization.csv'} and {fig}")
 
 
 def main() -> None:
     print("Card & Krueger (1994) replication workflow")
     df = step1_build_sample()
     step2_replicate(df)
-    step3_extension()
+    step3_extension(df)
     print("Done. Outputs written to outputs/tables/ and outputs/figures/.")
 
 
