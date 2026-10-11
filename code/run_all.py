@@ -65,10 +65,13 @@ def build_sample(df: pd.DataFrame) -> pd.DataFrame:
         0.0,
         (5.05 - df["WAGE_ST"]) / df["WAGE_ST"],
     )
+    df["nj"] = (df["STATE"] == 1).astype(int)
 
     # Wave-2 employment is set to 0 at permanently closed stores (paper note).
     df.loc[df["STATUS2"] == 3, ["fte2", "EMPFT2", "NMGRS2", "EMPPT2"]] = 0
     df.loc[df["STATUS2"] == 3, "pctft2"] = np.nan
+
+    df["dfte"] = df["fte2"] - df["fte1"]
 
     return df
 
@@ -231,6 +234,144 @@ def table2_means(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _ols(y: np.ndarray, X: np.ndarray) -> dict:
+    """OLS with an unrestricted constant. ``X`` is (n, k) without the constant."""
+    X = np.column_stack([np.ones(len(y)), X])
+    n, k = X.shape
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    resid = y - X @ beta
+    sigma2 = resid @ resid / (n - k)
+    cov = sigma2 * np.linalg.inv(X.T @ X)
+    return {
+        "beta": beta,
+        "se": np.sqrt(np.diag(cov)),
+        "resid": resid,
+        "ser": np.sqrt(sigma2),
+        "n": n,
+        "k": k,
+    }
+
+
+def _f_pvalue(y: np.ndarray, X_full: np.ndarray, X_restricted: np.ndarray) -> tuple:
+    """p-value of the joint F test that the extra regressors in X_full are zero."""
+    full = _ols(y, X_full)
+    rest = _ols(y, X_restricted)
+    q = full["k"] - rest["k"]
+    df = full["n"] - full["k"]
+    sse_f = full["resid"] @ full["resid"]
+    sse_r = rest["resid"] @ rest["resid"]
+    F = ((sse_r - sse_f) / q) / (sse_f / df)
+    try:
+        from scipy.stats import f as fdist
+        p = 1 - fdist.cdf(F, q, df)
+    except ImportError:
+        p = np.nan
+    return F, p
+
+
+def table3_employment(df: pd.DataFrame) -> pd.DataFrame:
+    """Reproduce Table 3 (average FTE employment before/after, by state and
+    NJ wage group)."""
+    groups = {
+        "PA": df.STATE == 0,
+        "NJ": df.STATE == 1,
+        "NJ wage=$4.25": (df.STATE == 1) & (df.WAGE_ST == 4.25),
+        "NJ wage=$4.26-4.99": (df.STATE == 1) & (df.WAGE_ST >= 4.26) & (df.WAGE_ST <= 4.99),
+        "NJ wage>=$5.00": (df.STATE == 1) & (df.WAGE_ST >= 5.00),
+    }
+
+    stats = {gname: {} for gname in groups}
+    for gname, mask in groups.items():
+        sub = df[mask]
+        before = mean_se(sub.fte1)
+        after = mean_se(sub.fte2)
+        change = (after[0] - before[0], np.sqrt(before[1] ** 2 + after[1] ** 2), np.nan)
+        d = sub.dfte.dropna()
+        balanced = (d.mean(), d.std(ddof=1) / np.sqrt(len(d)), len(d))
+        sub5 = df[mask].copy()
+        sub5.loc[sub5.STATUS2.isin([4, 5]), "fte2"] = 0.0
+        d5 = (sub5.fte2 - sub5.fte1).dropna()
+        temp0 = (d5.mean(), d5.std(ddof=1) / np.sqrt(len(d5)), len(d5))
+        stats[gname] = {"before": before, "after": after, "change": change,
+                        "balanced": balanced, "temp0": temp0}
+
+    row_names = ["before", "after", "change", "balanced", "temp0"]
+    records = []
+    for r in row_names:
+        for gname in groups:
+            m, se, n = stats[gname][r]
+            records.append({"Row": r, "Group": gname, "mean": m, "se": se, "n": n})
+
+    # Difference-in-differences on the balanced sample (headline result).
+    d_nj = df.loc[df.STATE == 1, "dfte"].dropna()
+    d_pa = df.loc[df.STATE == 0, "dfte"].dropna()
+    did = d_nj.mean() - d_pa.mean()
+    se_did = np.sqrt(d_nj.var(ddof=1) / len(d_nj) + d_pa.var(ddof=1) / len(d_pa))
+    records.append({"Row": "DiD (balanced, NJ-PA)", "Group": "t-stat",
+                    "mean": did, "se": se_did, "n": did / se_did})
+
+    return pd.DataFrame(records)
+
+
+def table4_reduced_form(df: pd.DataFrame) -> pd.DataFrame:
+    """Reproduce Table 4 (reduced-form models for change in FTE employment).
+
+    Sample: open stores with complete wave-1/2 employment and wage data, plus
+    the six permanently closed stores (employment change = -FTE1).
+    """
+    open_mask = (
+        (df.STATUS2 == 1)
+        & df.fte1.notna() & df.fte2.notna()
+        & df.WAGE_ST.notna() & df.WAGE_ST2.notna()
+    )
+    closed_mask = (df.STATUS2 == 3) & df.fte1.notna() & df.WAGE_ST.notna()
+    s = df.loc[open_mask | closed_mask].copy()
+
+    y = s.dfte.to_numpy()
+    nj = s.nj.to_numpy()
+    gap = s.gap.to_numpy()
+    chain = pd.get_dummies(s.CHAIN, prefix="c").drop(columns=["c_1"]).to_numpy()
+    coown = s.CO_OWNED.to_numpy().reshape(-1, 1)
+    region = s[["CENTRALJ", "NORTHJ", "PA1"]].to_numpy()
+
+    ctrl = np.column_stack([chain, coown])
+
+    def coef(X, term):
+        r = _ols(y, X)
+        return r["beta"][term], r["se"][term], r["ser"]
+
+    models = {
+        "i": ("NJ dummy", nj, None),
+        "ii": ("NJ dummy + chain/ownership", np.column_stack([nj, ctrl]), nj),
+        "iii": ("wage gap", gap, None),
+        "iv": ("wage gap + chain/ownership", np.column_stack([gap, ctrl]), gap),
+        "v": ("wage gap + chain/ownership + region", np.column_stack([gap, ctrl, region]), gap),
+    }
+
+    records = []
+    for key, (label, X, base_X) in models.items():
+        term_idx = 1  # coefficient on the first regressor (NJ dummy or GAP)
+        b, se, ser = coef(X, term_idx)
+        F = p = np.nan
+        if base_X is not None:
+            F, p = _f_pvalue(y, X, base_X)
+        records.append({
+            "Model": key,
+            "Specification": label,
+            "coefficient": b,
+            "se": se,
+            "ser": ser,
+            "F_controls": F,
+            "p_controls": p,
+            "n": len(y),
+        })
+
+    out = pd.DataFrame(records)
+    out.attrs["depvar_mean"] = y.mean()
+    out.attrs["depvar_sd"] = y.std(ddof=1)
+    return out
+
+
 def step1_build_sample() -> pd.DataFrame:
     """Reconstruct variables (FTE employment, wage GAP) and write processed data."""
     df = build_sample(load_raw())
@@ -252,12 +393,21 @@ def step2_replicate(df: pd.DataFrame) -> None:
     t2.to_csv(TABLES_DIR / "table2_means.csv", index=False)
     print(f"  table 2 -> {TABLES_DIR / 'table2_means.csv'}")
 
-    # TODO: Table 3 (DiD), Table 4 (reduced-form models), Figure 1 (wage dist).
+    t3 = table3_employment(df)
+    t3.to_csv(TABLES_DIR / "table3_employment.csv", index=False)
+    print(f"  table 3 -> {TABLES_DIR / 'table3_employment.csv'}")
+
+    t4 = table4_reduced_form(df)
+    t4.to_csv(TABLES_DIR / "table4_reduced_form.csv", index=False)
+    print(f"  table 4 -> {TABLES_DIR / 'table4_reduced_form.csv'} "
+          f"(n={t4.n.iloc[0]}, depvar mean={t4.attrs['depvar_mean']:.3f})")
+
+    # TODO: Figure 1 (starting-wage distribution).
 
 
 def step3_extension() -> None:
     """Run the independent extension."""
-    raise NotImplementedError("TODO: implement extension (step 3).")
+    print("  extension: not yet implemented (TODO).")
 
 
 def main() -> None:
