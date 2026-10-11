@@ -4,7 +4,7 @@ Replication of *"Minimum Wages and Employment: A Case Study of the Fast-Food
 Industry in New Jersey and Pennsylvania"* (Card & Krueger, *American Economic
 Review*, 1994), using a difference-in-differences design.
 
-Author: **HuangQiTong** (`u3676224@connect.hku.hk`)
+Author: **HuangQitong** (`u3676224@connect.hku.hk`)
 
 ## Repository structure
 
