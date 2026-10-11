@@ -372,6 +372,123 @@ def table4_reduced_form(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def figure1_wages(df: pd.DataFrame) -> Path:
+    """Reproduce Figure 1 (distribution of starting wage rates, by state and wave)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(8, 7))
+    bins = np.arange(4.0, 6.26, 0.25)
+    panels = [
+        ("WAGE_ST", "February 1992"),
+        ("WAGE_ST2", "November 1992"),
+    ]
+    for row, (wvar, wtitle) in enumerate(panels):
+        for col, (state, stitle) in enumerate([(1, "New Jersey"), (0, "Pennsylvania")]):
+            ax = axes[row, col]
+            vals = df.loc[df.STATE == state, wvar].dropna()
+            ax.hist(vals, bins=bins, weights=np.full(len(vals), 100 / len(vals)),
+                    edgecolor="black", color="0.85")
+            ax.set_title(f"{stitle} — {wtitle}", fontsize=10)
+            ax.set_xlabel("Starting wage ($/hour)")
+            ax.set_ylabel("Percent of stores")
+            ax.set_ylim(0, 90)
+            ax.axvline(5.05, color="red", linestyle="--", linewidth=1)
+    fig.suptitle("Distribution of Starting Wage Rates", fontsize=12)
+    fig.tight_layout()
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    path = FIGURES_DIR / "figure1_wage_distribution.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def table5_specification_tests(df: pd.DataFrame) -> pd.DataFrame:
+    """Reproduce Table 5, rows 1-5 (alternative employment measures).
+
+    Each row runs four reduced-form models (change in FTE, and proportional
+    change) on the NJ dummy and on the wage gap, with chain + company-ownership
+    controls. The proportional change is dFTE / mean(FTE1, FTE2); closed stores
+    are set to -1.
+    """
+
+    def make_fte(w_pt: float, include_mgr: bool, temp_zero: bool):
+        """Return (fte1, fte2) Series under a given FTE weighting.
+
+        Wave-2 employment is 0 for permanently closed stores and missing (or 0,
+        when ``temp_zero``) for temporarily closed stores.
+        """
+        mgr1 = df.NMGRS if include_mgr else 0.0
+        mgr2 = df.NMGRS2 if include_mgr else 0.0
+        fte1 = df.EMPFT + mgr1 + w_pt * df.EMPPT
+        fte2 = df.EMPFT2 + mgr2 + w_pt * df.EMPPT2
+        fte2 = fte2.where(df.STATUS2 != 3, 0.0)                      # closed -> 0
+        # renovation (2) + temporarily closed (4,5) = the paper's 4 "temporarily closed" stores
+        fte2 = fte2.where(~df.STATUS2.isin([2, 4, 5]), 0.0 if temp_zero else np.nan)
+        return fte1, fte2
+
+    # Fixed base sample (351 open + 6 closed = 357). Rows 3-5 keep this sample
+    # (the paper reports "no effect", i.e. no sample expansion); only row 2
+    # expands it by the four temporarily closed / under-renovation stores.
+    base_mask = (
+        (df.STATUS2 == 1)
+        & df.fte1.notna() & df.fte2.notna()
+        & df.WAGE_ST.notna() & df.WAGE_ST2.notna()
+    ) | ((df.STATUS2 == 3) & df.fte1.notna() & df.WAGE_ST.notna())
+
+    def run_row(label, fte1, fte2, mask):
+        d = df.assign(_fte1=fte1, _fte2=fte2)
+        s = d.loc[mask].copy()
+        s["dfte"] = s._fte2 - s._fte1
+        avg = (s._fte1 + s._fte2) / 2
+        s["prop"] = np.where(s._fte2 == 0, -1.0, s.dfte / avg)
+
+        chain = pd.get_dummies(s.CHAIN, prefix="c").drop(columns=["c_1"]).to_numpy()
+        coown = s.CO_OWNED.to_numpy().reshape(-1, 1)
+        ctrl = np.column_stack([chain, coown])
+        nj = s.nj.to_numpy()
+        gap = s.gap.to_numpy()
+        y_levels = s.dfte.to_numpy()
+        y_prop = s.prop.to_numpy()
+
+        def est(dep, X):
+            r = _ols(dep, X)
+            return r["beta"][1], r["se"][1]
+
+        return {
+            "Row": label,
+            "NJ_levels": est(y_levels, np.column_stack([nj, ctrl])),
+            "GAP_levels": est(y_levels, np.column_stack([gap, ctrl])),
+            "NJ_prop": est(y_prop, np.column_stack([nj, ctrl])),
+            "GAP_prop": est(y_prop, np.column_stack([gap, ctrl])),
+            "n": len(s),
+        }
+
+    specs = [
+        ("1. base (FTE = FT + mgr + 0.5 PT)", 0.5, True, False, False),
+        ("2. temp-closed stores = 0", 0.5, True, True, True),
+        ("3. exclude managers", 0.5, False, False, False),
+        ("4. part-time = 0.4 FTE", 0.4, True, False, False),
+        ("5. part-time = 0.6 FTE", 0.6, True, False, False),
+    ]
+
+    records = []
+    for label, w_pt, include_mgr, temp_zero, add_temp in specs:
+        fte1, fte2 = make_fte(w_pt, include_mgr, temp_zero)
+        mask = base_mask
+        if add_temp:
+            mask = mask | (df.STATUS2.isin([2, 4, 5]) & df.fte1.notna() & df.WAGE_ST.notna())
+        r = run_row(label, fte1, fte2, mask)
+        rec = {"Row": r["Row"], "n": r["n"]}
+        for key in ["NJ_levels", "GAP_levels", "NJ_prop", "GAP_prop"]:
+            rec[f"{key}_coef"] = r[key][0]
+            rec[f"{key}_se"] = r[key][1]
+        records.append(rec)
+
+    return pd.DataFrame(records)
+
+
 def step1_build_sample() -> pd.DataFrame:
     """Reconstruct variables (FTE employment, wage GAP) and write processed data."""
     df = build_sample(load_raw())
@@ -402,7 +519,12 @@ def step2_replicate(df: pd.DataFrame) -> None:
     print(f"  table 4 -> {TABLES_DIR / 'table4_reduced_form.csv'} "
           f"(n={t4.n.iloc[0]}, depvar mean={t4.attrs['depvar_mean']:.3f})")
 
-    # TODO: Figure 1 (starting-wage distribution).
+    t5 = table5_specification_tests(df)
+    t5.to_csv(TABLES_DIR / "table5_specification_tests.csv", index=False)
+    print(f"  table 5 -> {TABLES_DIR / 'table5_specification_tests.csv'}")
+
+    fig1 = figure1_wages(df)
+    print(f"  figure 1 -> {fig1}")
 
 
 def step3_extension() -> None:
