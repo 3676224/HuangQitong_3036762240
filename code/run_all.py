@@ -489,6 +489,142 @@ def table5_specification_tests(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def table6_nonwage(df: pd.DataFrame) -> pd.DataFrame:
+    """Reproduce Table 6 (full-time fraction and other nonwage outcomes).
+
+    Each row reports the mean change in the outcome for NJ and PA stores, their
+    difference, and the reduced-form coefficient on the NJ dummy / wage gap from
+    regressions for the change in the outcome (with chain + company-ownership
+    controls; column vi also adds region dummies). The sample is stores with the
+    outcome observed in both waves.
+    """
+
+    def ind(s: pd.Series, v) -> pd.Series:
+        # indicator that s == v, missing where s is missing
+        return s.eq(v).where(s.notna()).astype(float)
+
+    outcomes = [
+        ("Fraction full-time workers (%)",
+         df.EMPFT / (df.EMPFT + df.NMGRS + 0.5 * df.EMPPT) * 100,
+         df.EMPFT2 / (df.EMPFT2 + df.NMGRS2 + 0.5 * df.EMPPT2) * 100),
+        ("Hours open per weekday", df.HRSOPEN, df.HRSOPEN2),
+        ("Cash registers", df.NREGS, df.NREGS2),
+        ("Registers open at 11AM", df.NREGS11, df.NREGS112),
+        ("Low-price meal program (%)", ind(df.MEALS, 2) * 100, ind(df.MEALS2, 2) * 100),
+        ("Free meal program (%)", ind(df.MEALS, 1) * 100, ind(df.MEALS2, 1) * 100),
+        ("Low-price and free meals (%)", ind(df.MEALS, 3) * 100, ind(df.MEALS2, 3) * 100),
+        ("Time to first raise (weeks)", df.INCTIME, df.INCTIME2),
+        ("First raise amount (cents)", df.FIRSTINC * 100, df.FIRSTIN2 * 100),
+        ("Slope of wage profile (%/week)",
+         df.FIRSTINC / df.WAGE_ST * 100 / df.INCTIME,
+         df.FIRSTIN2 / df.WAGE_ST2 * 100 / df.INCTIME2),
+    ]
+
+    chain_full = pd.get_dummies(df.CHAIN, prefix="c").drop(columns=["c_1"]).to_numpy()
+    coown_full = df.CO_OWNED.to_numpy().reshape(-1, 1)
+    region_full = df[["CENTRALJ", "NORTHJ", "PA1"]].to_numpy()
+    nj_full = df.nj.to_numpy()
+    gap_full = df.gap.to_numpy()
+    state_full = df.STATE.to_numpy()
+
+    records = []
+    for name, f1, f2 in outcomes:
+        change = (f2 - f1).to_numpy()
+        valid = ~np.isnan(change)
+        nj_v = state_full == 1
+        pa_v = state_full == 0
+        nj_mean = change[valid & nj_v].mean()
+        pa_mean = change[valid & pa_v].mean()
+        diff = nj_mean - pa_mean
+        nnj = int((valid & nj_v).sum())
+        npa = int((valid & pa_v).sum())
+        se_diff = np.sqrt(
+            change[valid & nj_v].var(ddof=1) / nnj
+            + change[valid & pa_v].var(ddof=1) / npa
+        )
+        t_diff = diff / se_diff if se_diff > 0 else np.nan
+
+        reg = (
+            valid
+            & df.WAGE_ST.notna().to_numpy()
+            & df.CHAIN.notna().to_numpy()
+            & df.CO_OWNED.notna().to_numpy()
+        )
+        y = change[reg]
+        X_nj = np.column_stack([nj_full[reg], chain_full[reg], coown_full[reg]])
+        X_gap = np.column_stack([gap_full[reg], chain_full[reg], coown_full[reg]])
+        X_gap_r = np.column_stack(
+            [gap_full[reg], chain_full[reg], coown_full[reg], region_full[reg]]
+        )
+        r_nj = _ols(y, X_nj)
+        r_gap = _ols(y, X_gap)
+        r_gap_r = _ols(y, X_gap_r)
+
+        records.append({
+            "Outcome": name,
+            "NJ_mean_change": nj_mean,
+            "PA_mean_change": pa_mean,
+            "NJ_minus_PA": diff,
+            "NJ_minus_PA_t": t_diff,
+            "n": int(reg.sum()),
+            "NJ_dummy_coef": r_nj["beta"][1], "NJ_dummy_se": r_nj["se"][1],
+            "GAP_coef": r_gap["beta"][1], "GAP_se": r_gap["se"][1],
+            "GAP_region_coef": r_gap_r["beta"][1], "GAP_region_se": r_gap_r["se"][1],
+        })
+
+    return pd.DataFrame(records)
+
+
+def table7_prices(df: pd.DataFrame) -> pd.DataFrame:
+    """Reproduce Table 7 (reduced-form models for the change in the log price of
+    a full meal). The full meal price is PSODA + PFRY + PENTREE (after-tax)."""
+    meal1 = df.PSODA + df.PFRY + df.PENTREE
+    meal2 = df.PSODA2 + df.PFRY2 + df.PENTREE2
+    dlnp = np.log(meal2) - np.log(meal1)
+
+    sample = (
+        meal1.notna() & meal2.notna()
+        & df.WAGE_ST.notna() & df.WAGE_ST2.notna()
+        & df.fte1.notna() & df.fte2.notna()
+    )
+    s = df.loc[sample].copy()
+    y = np.log(s.PSODA2 + s.PFRY2 + s.PENTREE2).to_numpy() - np.log(
+        s.PSODA + s.PFRY + s.PENTREE
+    ).to_numpy()
+
+    nj = s.nj.to_numpy()
+    gap = s.gap.to_numpy()
+    chain = pd.get_dummies(s.CHAIN, prefix="c").drop(columns=["c_1"]).to_numpy()
+    coown = s.CO_OWNED.to_numpy().reshape(-1, 1)
+    region = s[["CENTRALJ", "NORTHJ", "PA1"]].to_numpy()
+    ctrl = np.column_stack([chain, coown])
+
+    models = {
+        "i": ("NJ dummy", np.column_stack([nj])),
+        "ii": ("NJ dummy + chain/ownership", np.column_stack([nj, ctrl])),
+        "iii": ("wage gap", np.column_stack([gap])),
+        "iv": ("wage gap + chain/ownership", np.column_stack([gap, ctrl])),
+        "v": ("wage gap + chain/ownership + region", np.column_stack([gap, ctrl, region])),
+    }
+
+    records = []
+    for key, (label, X) in models.items():
+        r = _ols(y, X)
+        records.append({
+            "Model": key,
+            "Specification": label,
+            "coefficient": r["beta"][1],
+            "se": r["se"][1],
+            "ser": r["ser"],
+            "n": r["n"],
+        })
+
+    out = pd.DataFrame(records)
+    out.attrs["depvar_mean"] = y.mean()
+    out.attrs["depvar_sd"] = y.std(ddof=1)
+    return out
+
+
 def step1_build_sample() -> pd.DataFrame:
     """Reconstruct variables (FTE employment, wage GAP) and write processed data."""
     df = build_sample(load_raw())
@@ -522,6 +658,15 @@ def step2_replicate(df: pd.DataFrame) -> None:
     t5 = table5_specification_tests(df)
     t5.to_csv(TABLES_DIR / "table5_specification_tests.csv", index=False)
     print(f"  table 5 -> {TABLES_DIR / 'table5_specification_tests.csv'}")
+
+    t6 = table6_nonwage(df)
+    t6.to_csv(TABLES_DIR / "table6_nonwage_outcomes.csv", index=False)
+    print(f"  table 6 -> {TABLES_DIR / 'table6_nonwage_outcomes.csv'}")
+
+    t7 = table7_prices(df)
+    t7.to_csv(TABLES_DIR / "table7_prices.csv", index=False)
+    print(f"  table 7 -> {TABLES_DIR / 'table7_prices.csv'} "
+          f"(n={t7.n.iloc[0]}, depvar mean={t7.attrs['depvar_mean']:.4f})")
 
     fig1 = figure1_wages(df)
     print(f"  figure 1 -> {fig1}")
