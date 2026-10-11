@@ -737,6 +737,128 @@ def extension_randomization(df: pd.DataFrame, n_perm: int = 10000, seed: int = 4
     return table, fig_path
 
 
+def extension_heterogeneity(df: pd.DataFrame):
+    """Independent extension: treatment-effect heterogeneity.
+
+    Splits the balanced DiD sample by four pre-treatment (wave-1) store
+    characteristics and estimates the DiD (NJ - PA change in FTE employment)
+    separately within each subgroup. A formal heterogeneity test (interacted-DiD
+    F test) asks whether the effect differs across subgroups. Every subgroup
+    variable is measured before the minimum-wage change, so none is itself
+    affected by the treatment.
+    """
+    s = df[df.dfte.notna()].copy()
+    y = s.dfte.to_numpy()
+    nj = s.nj.to_numpy()
+
+    med = s.fte1.median()
+
+    def dim(name, masks):
+        g = np.full(len(s), -1, dtype=int)
+        for i, m in enumerate(masks):
+            g[m.to_numpy()] = i
+        return name, g
+
+    dimensions = [
+        dim("Initial wage", [s.WAGE_ST < 5.05, s.WAGE_ST >= 5.05]),
+        dim("Store size", [s.fte1 < med, s.fte1 >= med]),
+        dim("Ownership", [s.CO_OWNED == 0, s.CO_OWNED == 1]),
+        dim("Chain", [s.CHAIN == 1, s.CHAIN == 2, s.CHAIN == 3, s.CHAIN == 4]),
+    ]
+    subgroup_labels = {
+        "Initial wage": ["wage < $5.05", "wage >= $5.05"],
+        "Store size": ["small (below median)", "large (>= median)"],
+        "Ownership": ["franchise", "company-owned"],
+        "Chain": ["Burger King", "KFC", "Roy Rogers", "Wendy's"],
+    }
+
+    def subgroup_did(g_idx):
+        keep = g_idx >= 0
+        yy = y[keep]
+        nn = nj[keep]
+        gg = g_idx[keep]
+        G = int(gg.max()) + 1
+        D = np.zeros((len(yy), G))
+        D[np.arange(len(yy)), gg] = 1.0
+        inter = D * nn[:, None]
+        X_full = np.column_stack([inter, D[:, 1:]])
+        X_rest = np.column_stack([nn, D[:, 1:]])
+        r_full = _ols(yy, X_full)
+        F, p = _f_pvalue(yy, X_full, X_rest)
+        out = []
+        for gg_ in range(G):
+            out.append(
+                (
+                    r_full["beta"][gg_ + 1],
+                    r_full["se"][gg_ + 1],
+                    int(((nn == 1) & (gg == gg_)).sum()),
+                    int(((nn == 0) & (gg == gg_)).sum()),
+                )
+            )
+        return out, F, p
+
+    records = []
+    forest = []
+    for name, g in dimensions:
+        per_group, F, p = subgroup_did(g)
+        labels = subgroup_labels[name]
+        for (coef, se, n_nj, n_pa), lab in zip(per_group, labels):
+            records.append(
+                {
+                    "Dimension": name,
+                    "Subgroup": lab,
+                    "n_NJ": n_nj,
+                    "n_PA": n_pa,
+                    "DiD": coef,
+                    "SE": se,
+                    "t": coef / se if se > 0 else np.nan,
+                    "heterog_F": F,
+                    "heterog_p": p,
+                }
+            )
+            forest.append((name, lab, coef, se))
+
+    table = pd.DataFrame(records)
+
+    # ---- forest plot of subgroup DiDs ----
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    pos = np.arange(len(forest))[::-1]
+    coefs = np.array([f[2] for f in forest])
+    ses = np.array([f[3] for f in forest])
+    colors = {
+        "Initial wage": "tab:blue",
+        "Store size": "tab:green",
+        "Ownership": "tab:orange",
+        "Chain": "tab:red",
+    }
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for i, (dim_name, lab, c, se) in enumerate(forest):
+        ax.errorbar(c, pos[i], xerr=1.96 * se, fmt="o",
+                    color=colors[dim_name], capsize=3, ms=5)
+    ax.axvline(0, color="0.3", linewidth=0.8)
+    ax.set_yticks(pos)
+    ax.set_yticklabels([f"{d}  ·  {l}" for d, l, _, _ in forest], fontsize=8)
+    ax.set_xlabel("DiD (NJ − PA change in FTE employment)")
+    ax.set_title("Heterogeneous treatment effects (DiD with 95% CI)")
+    handles = [
+        Line2D([0], [0], marker="o", color="none", markerfacecolor=colors[d],
+               markersize=7, label=d)
+        for d in colors
+    ]
+    ax.legend(handles=handles, fontsize=8, loc="lower right")
+    fig.tight_layout()
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    fig_path = FIGURES_DIR / "figure_extension_heterogeneity.png"
+    fig.savefig(fig_path, dpi=150)
+    plt.close(fig)
+
+    return table, fig_path
+
+
 def step1_build_sample() -> pd.DataFrame:
     """Reconstruct variables (FTE employment, wage GAP) and write processed data."""
     df = build_sample(load_raw())
@@ -785,12 +907,18 @@ def step2_replicate(df: pd.DataFrame) -> None:
 
 
 def step3_extension(df: pd.DataFrame) -> None:
-    """Run the independent extension (randomization inference)."""
-    table, fig = extension_randomization(df)
+    """Run the independent extensions (randomization inference + heterogeneity)."""
     TABLES_DIR.mkdir(parents=True, exist_ok=True)
-    table.to_csv(TABLES_DIR / "extension_randomization.csv", index=False)
+
+    rtable, rfig = extension_randomization(df)
+    rtable.to_csv(TABLES_DIR / "extension_randomization.csv", index=False)
     print(f"  extension (randomization inference) -> "
-          f"{TABLES_DIR / 'extension_randomization.csv'} and {fig}")
+          f"{TABLES_DIR / 'extension_randomization.csv'} and {rfig}")
+
+    htable, hfig = extension_heterogeneity(df)
+    htable.to_csv(TABLES_DIR / "extension_heterogeneity.csv", index=False)
+    print(f"  extension (heterogeneity) -> "
+          f"{TABLES_DIR / 'extension_heterogeneity.csv'} and {hfig}")
 
 
 def main() -> None:
