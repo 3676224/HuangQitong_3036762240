@@ -23,7 +23,7 @@ Author: **HuangQitong** (`u3676224@connect.hku.hk`)
 ├── skills/
 │   └── SKILL.md                 # Reusable skill / workflow description
 ├── AI_USE_DISCLOSURE.md         # AI usage and verification
-├── report.docx                  # Final empirical report
+├── report.pdf                   # Final empirical report (PDF)
 └── README.md                    # This file
 ```
 
