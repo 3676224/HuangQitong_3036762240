@@ -23,7 +23,7 @@ Author: **HuangQitong** (`u3676224@connect.hku.hk`)
 ├── skills/
 │   └── SKILL.md                 # Reusable skill / workflow description
 ├── AI_USE_DISCLOSURE.md         # AI usage and verification
-├── report.pdf                   # Final empirical report
+├── report.docx                  # Final empirical report
 └── README.md                    # This file
 ```
 
@@ -49,6 +49,7 @@ input file is in place.
 
 - Reconstructed analysis sample (FTE employment, wage-GAP variable, balanced
   sample, handling of closed stores).
-- Replication of the paper's core results (difference-in-differences employment
-  estimates, reduced-form models, starting-wage distribution figure).
-- One independent extension (see the report and `skills/SKILL.md`).
+- Replication of the paper's core results (Tables 1–7, reduced-form models,
+  starting-wage distribution figure).
+- Two independent extensions: randomization inference and treatment-effect
+  heterogeneity (see `skills/SKILL.md` and the report).
